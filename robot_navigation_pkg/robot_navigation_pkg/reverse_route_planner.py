@@ -52,7 +52,7 @@ class FeasiblePlannerFSM(Node):
         self.slow_factor_inner = 0.35
 
         # ===== ROS =====
-        self.cmd_pub = self.create_publisher(Twist, "cmd_vel", 10)
+        self.cmd_pub = self.create_publisher(Twist, "j100_0000/cmd_vel", 10)
         self.create_subscription(PoseArray, "pursuitgoal", self.wp_cb, 10)
 
         self.tf_buffer = Buffer()
