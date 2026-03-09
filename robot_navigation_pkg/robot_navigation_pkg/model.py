@@ -27,8 +27,8 @@ class TwistToTFNode(Node):
         self.child_frame = 'base_link'
 
         # Állapotváltozók
-        self.x = -10.0
-        self.y = -10.0
+        self.x = 0.0
+        self.y = 0.0
         self.theta = 0.0
         self.linear_vel = 0.0
         self.angular_vel = 0.0
@@ -101,4 +101,5 @@ def main(args=None):
 
 
 if __name__ == '__main__':
+
     main()
