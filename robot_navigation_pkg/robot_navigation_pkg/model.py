@@ -14,7 +14,7 @@ class TwistToTFNode(Node):
         # Twist üzenetek fogadása
         self.subscription = self.create_subscription(
             Twist,
-            '/cmd_vel',
+            'j100_0000/cmd_vel',
             self.twist_callback,
             10
         )
