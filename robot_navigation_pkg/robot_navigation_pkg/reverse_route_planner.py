@@ -44,6 +44,11 @@ class FeasiblePlannerFSM(Node):
         self.heading_kp = 2.0
         self.switch_delay = 0.5
 
+        # ===== Korábbi pontok közelségi korlátai (tolatáshoz) =====
+        self.prev_wp_slow_radius = 0.35
+        self.prev_wp_stop_radius = 0.20
+        self.forward_accel_duration = 0.5  # 0.5 mp összidejű gyorsítás
+
         # ===== Forward lassítás =====
         self.angle_threshold = math.radians(15.0)
         self.slow_radius_outer = 0.5
@@ -72,6 +77,7 @@ class FeasiblePlannerFSM(Node):
         self.reverse_speed = -0.25
         self.reverse_travel = 0.0
         self.last_time = None
+        self.prev_min_d = None
 
     # ============================================================
 
@@ -85,6 +91,7 @@ class FeasiblePlannerFSM(Node):
     # ============================================================
 
     def change_state(self, new_state):
+        self.get_logger().info(f"Állapotváltás: {self.state} -> {new_state}")
         self.state = new_state
         self.state_start_time = self.now()
         self.last_time = None
@@ -143,6 +150,9 @@ class FeasiblePlannerFSM(Node):
 
         now = self.now()
 
+        # Legközelebbi már teljesített (korábbi) pont távolsága
+        min_prev_d = self.get_min_dist_to_reached(rx, ry)
+
         # ============================================================
         # FSM
         # ============================================================
@@ -166,6 +176,7 @@ class FeasiblePlannerFSM(Node):
             if now - self.state_start_time >= self.switch_delay:
                 self.reverse_speed = -0.25
                 self.reverse_travel = 0.0
+                self.prev_min_d = min_prev_d
                 self.change_state("REVERSE_ACCEL")
 
             self.publish(0.0, 0.0)
@@ -176,6 +187,7 @@ class FeasiblePlannerFSM(Node):
 
             if now - self.state_start_time >= 0.2:
                 self.reverse_speed = self.v_reverse
+                self.prev_min_d = min_prev_d
                 self.change_state("REVERSE_CRUISE")
 
             self.integrate_reverse(now)
@@ -186,10 +198,51 @@ class FeasiblePlannerFSM(Node):
         # ---------------- REVERSE CRUISE ----------------
         if self.state == "REVERSE_CRUISE":
 
+            # 1) Ellenőrizzük, hogy közeledünk-e egy korábbi ponthoz és beléptünk-e a 0.35 m-es zónába
+            is_approaching = (self.prev_min_d is not None and min_prev_d < self.prev_min_d)
+            self.prev_min_d = min_prev_d
+
+            if min_prev_d <= self.prev_wp_stop_radius and is_approaching:
+                # Ha elértük a 0.20 m-es sugarat, azonnal 0.5 mp megállás, majd előre indulás
+                self.change_state("REVERSE_TO_FORWARD_DELAY")
+                self.publish(0.0, 0.0)
+                return
+
+            if min_prev_d <= self.prev_wp_slow_radius and is_approaching:
+                # Ha beléptünk a 0.35 m-es sugárba, átváltunk a felezett sebességű tolatásba
+                self.reverse_speed = self.v_reverse * 0.5
+                self.change_state("REVERSE_PROXIMITY_SLOW")
+                self.integrate_reverse(now)
+                w = self.compute_angular(self.reverse_speed, alpha)
+                self.publish(self.reverse_speed, w)
+                return
+
+            # 2) Normál tolatási feltétel
             self.integrate_reverse(now)
 
             if feasible and self.reverse_travel >= self.min_reverse_dist:
                 self.change_state("REVERSE_SLOW_PHASE")
+
+            w = self.compute_angular(self.reverse_speed, alpha)
+            self.publish(self.reverse_speed, w)
+            return
+
+        # ---------------- REVERSE PROXIMITY SLOW (0.35 m-en belül) ----------------
+        if self.state == "REVERSE_PROXIMITY_SLOW":
+
+            self.reverse_speed = self.v_reverse * 0.5  # Felezett tolatási sebesség (-0.25 m/s)
+            self.integrate_reverse(now)
+
+            # Ha eléri a 0.20 m-es sugarat -> teljes megállás 0.5 mp-re
+            if min_prev_d <= self.prev_wp_stop_radius:
+                self.change_state("REVERSE_TO_FORWARD_DELAY")
+                self.publish(0.0, 0.0)
+                return
+
+            # Ha közben esetleg teljesülne a normál tolatási feltétel is
+            if feasible and self.reverse_travel >= self.min_reverse_dist:
+                self.change_state("REVERSE_SLOW_PHASE")
+                return
 
             w = self.compute_angular(self.reverse_speed, alpha)
             self.publish(self.reverse_speed, w)
@@ -212,16 +265,54 @@ class FeasiblePlannerFSM(Node):
             self.publish(v, w)
             return
 
-        # ---------------- DELAY R->F ----------------
+        # ---------------- DELAY R->F (0.5 mp megállás) ----------------
         if self.state == "REVERSE_TO_FORWARD_DELAY":
 
             if now - self.state_start_time >= self.switch_delay:
-                self.change_state("FORWARD")
+                self.change_state("FORWARD_ACCEL")
 
             self.publish(0.0, 0.0)
             return
 
+        # ---------------- FORWARD ACCEL (0.5 mp, 0.1 mp-enkénti gyorsítás) ----------------
+        if self.state == "FORWARD_ACCEL":
+
+            elapsed = now - self.state_start_time
+
+            # 0.5 mp lejárta után kapcsol vissza a sima FORWARD (simple goal pursuit) állapotba
+            if elapsed >= self.forward_accel_duration:
+                self.change_state("FORWARD")
+                v = self.compute_forward_speed(d, alpha)
+                w = self.compute_angular(v, alpha)
+                self.publish(v, w)
+                return
+
+            # Tizedmásodpercenkénti (0.1 mp) lépcsőzetes gyorsítás (5 lépcső: 0.2, 0.4, 0.6, 0.8, 1.0)
+            step_idx = int(elapsed / 0.1) + 1  # 1, 2, 3, 4, 5
+            accel_ratio = min(step_idx * 0.2, 1.0)
+
+            target_v = self.compute_forward_speed(d, alpha)
+            v = target_v * accel_ratio
+            w = self.compute_angular(v, alpha)
+
+            # Nem vizsgáljuk a feasible feltételt, mindenképp megyünk a következő pont felé
+            self.publish(v, w)
+            return
+
     # ============================================================
+
+    def get_min_dist_to_reached(self, rx, ry):
+        """Visszaadja a legkisebb távolságot bármely már teljesített (korábbi) waypointhoz."""
+        min_d = float("inf")
+        if self.wps is None or not self.reached:
+            return min_d
+
+        for i, p in enumerate(self.wps.poses):
+            if self.reached[i]:
+                dist = hypot(p.position.x - rx, p.position.y - ry)
+                if dist < min_d:
+                    min_d = dist
+        return min_d
 
     def compute_forward_speed(self, d, alpha):
 
